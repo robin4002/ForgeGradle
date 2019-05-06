@@ -22,6 +22,11 @@ package net.minecraftforge.gradle.common.util;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+
 import org.apache.commons.lang3.tuple.ImmutableTriple;
 import org.apache.commons.lang3.tuple.Triple;
 import org.gradle.api.Project;
@@ -46,7 +51,9 @@ import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
 import java.io.File;
-import java.util.Collection;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.Writer;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -109,6 +116,52 @@ public final class IDEUtils {
                         e.printStackTrace();
                     }
                 });
+            });
+        });
+
+        project.getTasks().register("genVSCodeRuns", Task.class, task -> {
+            task.setGroup(RunConfig.RUNS_GROUP);
+            task.dependsOn((ImmutableList.of(prepareRuns.get(), makeSourceDirs.get())));
+
+            task.doLast(t -> {
+                try {
+                    final File runConfigurationsDir = new File(project.getProjectDir(), ".vscode");
+
+                    if (!runConfigurationsDir.exists()) {
+                        runConfigurationsDir.mkdirs();
+                    }
+
+                    final JsonObject rootObject = new JsonObject();
+                    rootObject.addProperty("version", "0.2.0");
+                    JsonArray runConfigs = new JsonArray();
+                    minecraft.getRuns().forEach(runConfig -> {
+                        final Stream<String> propStream = runConfig.getProperties().entrySet().stream().map(kv -> String.format("-D%s=%s", kv.getKey(), kv.getValue()));
+                        final String props = Stream.concat(propStream, runConfig.getJvmArgs().stream()).collect(Collectors.joining(" "));
+                        JsonObject config = new JsonObject();
+                        config.addProperty("type", "java");
+                        config.addProperty("name", runConfig.getTaskName());
+                        config.addProperty("request", "launch");
+                        config.addProperty("mainClass", runConfig.getMain());
+                        config.addProperty("projectName", project.getName());
+                        config.addProperty("cwd", runConfig.getWorkingDirectory());
+                        config.addProperty("vmArgs", props);
+                        config.addProperty("args", String.join(" ", runConfig.getArgs()));
+                        JsonObject env = new JsonObject();
+                        runConfig.getEnvironment().compute("MOD_CLASSES", (key, value) -> mapModClasses(key, value, project, runConfig));
+                        runConfig.getEnvironment().forEach((name, value) -> {
+                            env.addProperty(name, value);
+                        });
+                        config.add("env", env);
+                        runConfigs.add(config);
+                    });
+                    rootObject.add("configurations", runConfigs);
+                    Writer writer = new FileWriter(new File(runConfigurationsDir, "launch.json"));
+                    Gson gson = new GsonBuilder().setPrettyPrinting().create();
+                    writer.write(gson.toJson(rootObject));
+                    writer.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             });
         });
     }
@@ -232,49 +285,7 @@ public final class IDEUtils {
                 {
                     envs.setAttribute("key", "org.eclipse.debug.core.environmentVariables");
 
-                    runConfig.getEnvironment().compute("MOD_CLASSES", (key, value) -> {
-                        // Only replace environment variable if it is already set
-                        if (value == null || value.isEmpty()) {
-                            return value;
-                        }
-
-                        final EclipseModel eclipse = project.getExtensions().findByType(EclipseModel.class);
-
-                        if (eclipse != null) {
-                            final Map<String, String> outputs = eclipse.getClasspath().resolveDependencies().stream()
-                                    .filter(SourceFolder.class::isInstance)
-                                    .map(SourceFolder.class::cast)
-                                    .map(SourceFolder::getOutput)
-                                    .distinct()
-                                    .collect(Collectors.toMap(output -> output.split("/")[output.split("/").length - 1], output -> project.file(output).getAbsolutePath()));
-
-                            if (runConfig.getMods().isEmpty()) {
-                                return runConfig.getAllSources().stream()
-                                        .map(SourceSet::getName)
-                                        .filter(outputs::containsKey)
-                                        .map(outputs::get)
-                                        .map(s -> String.join(File.pathSeparator, s, s)) // <resources>:<classes>
-                                        .collect(Collectors.joining(File.pathSeparator));
-                            } else {
-                                final SourceSet main = project.getConvention().getPlugin(JavaPluginConvention.class).getSourceSets().getByName(SourceSet.MAIN_SOURCE_SET_NAME);
-
-                                return runConfig.getMods().stream()
-                                        .map(modConfig -> {
-                                            return (modConfig.getSources().isEmpty() ? Stream.of(main) : modConfig.getSources().stream())
-                                                    .map(SourceSet::getName)
-                                                    .filter(outputs::containsKey)
-                                                    .map(outputs::get)
-                                                    .map(output -> modConfig.getName() + "%%" + output)
-                                                    .map(s -> String.join(File.pathSeparator, s, s)); // <resources>:<classes>
-                                        })
-                                        .flatMap(Function.identity())
-                                        .collect(Collectors.joining(File.pathSeparator));
-                            }
-                        }
-
-                        return value;
-                    });
-
+                    runConfig.getEnvironment().compute("MOD_CLASSES", (key, value) -> mapModClasses(key, value, project, runConfig));
                     runConfig.getEnvironment().forEach((name, value) -> {
                         final Element envEntry = javaDocument.createElement("mapEntry");
                         {
@@ -293,6 +304,49 @@ public final class IDEUtils {
         return documents;
     }
 
+    private static String mapModClasses(String key, String value, @Nonnull final Project project, @Nonnull final RunConfig runConfig) {
+        // Only replace environment variable if it is already set
+        if (value == null || value.isEmpty()) {
+            return value;
+        }
+
+        final EclipseModel eclipse = project.getExtensions().findByType(EclipseModel.class);
+
+        if (eclipse != null) {
+            final Map<String, String> outputs = eclipse.getClasspath().resolveDependencies().stream()
+                    .filter(SourceFolder.class::isInstance)
+                    .map(SourceFolder.class::cast)
+                    .map(SourceFolder::getOutput)
+                    .distinct()
+                    .collect(Collectors.toMap(output -> output.split("/")[output.split("/").length - 1], output -> project.file(output).getAbsolutePath()));
+
+            if (runConfig.getMods().isEmpty()) {
+                return runConfig.getAllSources().stream()
+                        .map(SourceSet::getName)
+                        .filter(outputs::containsKey)
+                        .map(outputs::get)
+                        .map(s -> String.join(File.pathSeparator, s, s)) // <resources>:<classes>
+                        .collect(Collectors.joining(File.pathSeparator));
+            } else {
+                final SourceSet main = project.getConvention().getPlugin(JavaPluginConvention.class).getSourceSets().getByName(SourceSet.MAIN_SOURCE_SET_NAME);
+
+                return runConfig.getMods().stream()
+                        .map(modConfig -> {
+                            return (modConfig.getSources().isEmpty() ? Stream.of(main) : modConfig.getSources().stream())
+                                    .map(SourceSet::getName)
+                                    .filter(outputs::containsKey)
+                                    .map(outputs::get)
+                                    .map(output -> modConfig.getName() + "%%" + output)
+                                    .map(s -> String.join(File.pathSeparator, s, s)); // <resources>:<classes>
+                        })
+                        .flatMap(Function.identity())
+                        .collect(Collectors.joining(File.pathSeparator));
+            }
+        }
+
+        return value;
+    }
+
     @FunctionalInterface
     private interface RunConfigurationGenerator {
 
@@ -300,5 +354,4 @@ public final class IDEUtils {
         Map<String, Document> createRunConfigurationXML(@Nonnull final Project project, @Nonnull final RunConfig runConfig, @Nonnull final String props, @Nonnull final DocumentBuilder documentBuilder);
 
     }
-
 }
